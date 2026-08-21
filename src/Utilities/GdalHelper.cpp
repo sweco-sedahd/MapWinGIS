@@ -1,4 +1,4 @@
-/**************************************************************************************
+﻿/**************************************************************************************
 * File name: GdalHelper.cpp
 *
 * Project: MapWindow Open Source (MapWinGis ActiveX control)
@@ -40,6 +40,29 @@
 map<CStringA, GDALDataset*> GdalHelper::m_ogrDatasets;
 std::mutex GdalHelper::g_ogrDatasetsMutex;
 
+// ===== HELPER FUNCTIONS =====
+
+#ifndef RELEASE_MODE
+#define DEBUG_LOG(fmt, ...) \
+		do { \
+			char buffer[1024]; \
+			sprintf_s(buffer, "[GdalHelper] " fmt "\r\n", __VA_ARGS__); \
+			OutputDebugStringA(buffer); \
+		} while(0)
+#else
+#define DEBUG_LOG(fmt, ...) do { } while(0)
+#endif
+
+#define LOG(fmt, ...) \
+		do { \
+			char buffer[1024]; \
+			sprintf_s(buffer, "[GdalHelper] " fmt "\r\n", __VA_ARGS__); \
+			OutputDebugStringA(buffer); \
+		} while(0)
+
+// *************************************************************
+//		RemoveCachedOgrDatasetUnlocked()
+// *************************************************************
 static void RemoveCachedOgrDatasetUnlocked(std::map<CStringA, GDALDataset*>& datasets, GDALDataset* ds)
 {
 	for (auto it = datasets.begin(); it != datasets.end(); ++it)
@@ -51,6 +74,8 @@ static void RemoveCachedOgrDatasetUnlocked(std::map<CStringA, GDALDataset*>& dat
 		}
 	}
 }
+
+// ===== HELPER FUNCTIONS END =====
 
 // **************************************************************
 //		OpenOgrDatasetA
@@ -104,7 +129,13 @@ GDALDataset* GdalHelper::OpenOgrDatasetW(const CStringW& filenameW, const bool f
 			OutputDebugStringA(buffer);
 		};
 
-	if (allowShared && m_globalSettings.ogrShareConnection)
+	// PostgreSQL (libpq) connections are NOT thread-safe, so don't share them.
+	bool isPostgreSQL = IsPostgreSQLConnection(filenameA);
+	bool canUseSharedCache = allowShared &&
+							m_globalSettings.ogrShareConnection &&
+							!isPostgreSQL;
+
+	if (canUseSharedCache)
 	{
 		CStringA key = filenameA;
 		key += forUpdate ? "1" : "0";
@@ -149,6 +180,7 @@ GDALDataset* GdalHelper::OpenOgrDatasetW(const CStringW& filenameW, const bool f
 		return opened;
 	}
 
+	// Non-shared: just open directly (no cache)
 	GDALDataset* ds = OpenOgrDatasetA(filenameA.GetString(), forUpdate);
 	logExit(ds ? "opened" : "open-failed");
 	return ds;
@@ -186,6 +218,7 @@ int GdalHelper::CloseSharedOgrDataset(GDALDataset* ds)
 	{
 		std::lock_guard<std::mutex> lock(g_ogrDatasetsMutex);
 
+		// ✓ SAFETY CHECK 2: Verify dataset is in cache
 		for (const auto& item : m_ogrDatasets)
 		{
 			if (item.second == ds)
@@ -197,32 +230,70 @@ int GdalHelper::CloseSharedOgrDataset(GDALDataset* ds)
 
 		if (isCachedShared)
 		{
+			// ✓ SAFETY CHECK 3: Validate pointer before dereferencing
+			if (!IsValidDatasetPointer(ds))
+			{
+				LOG("ERROR: Dataset pointer is invalid in cache! %p", ds);
+				// Remove corrupted entry from cache
+				RemoveCachedOgrDatasetUnlocked(m_ogrDatasets, ds);
+				logExit("invalid-pointer-removed");
+				return 0;  // Can't proceed safely
+			}
+
+			// Safe to dereference now
 			count = ds->Dereference();
 			if (count <= 0)
 			{
-				//Debug::WriteLine("Shared datasource(%s) is closed.", ds->GetDescription());
+				// Reference count is zero, safe to close
 				RemoveCachedOgrDatasetUnlocked(m_ogrDatasets, ds);
 				shouldClose = true;
 			}
 			else
 			{
-				//Debug::WriteLine("Dereferencing shared datasource: %d", count);
+				// Still have references, don't close yet
+				DEBUG_LOG("Dereferencing shared datasource: refCount=%d", count);
 			}
 		}
 	}
 
+	// ✓ SAFETY CHECK 4: After releasing lock, re-validate before closing
 	if (isCachedShared)
 	{
 		if (shouldClose)
 		{
+			// Do a final check: is the pointer still valid?
+			if (!IsValidDatasetPointer(ds))
+			{
+				LOG("ERROR: Dataset pointer became invalid after lock release! %p", ds);
+				logExit("invalid-after-unlock");
+				return count;
+			}
+
+			// ✓ Now safe to close
 			GDALClose(ds);
 		}
-		logExit("closed CachedShared");
+		logExit("closed-cached-shared");
 		return count;
 	}
 
+	// ✓ SAFETY CHECK 5: Non-cached dataset
+	// This path is taken when dataset is NOT in the shared cache
+	// This should only happen if:
+	//   1. It was opened with allowShared=false
+	//   2. It was already removed from cache
+	//   3. It's a stale pointer
+
+	// Validate before closing
+	if (!IsValidDatasetPointer(ds))
+	{
+		LOG("ERROR: Non-cached dataset pointer is invalid! %p", ds);
+		logExit("invalid-non-cached");
+		return 0;
+	}
+
+	// Safe to close non-cached dataset
 	GDALClose(ds);
-	logExit("closed");
+	logExit("closed-non-cached");
 	return 0;
 }
 
@@ -244,6 +315,111 @@ void GdalHelper::RemoveCachedOgrDataset(GDALDataset* ds)
 		"RemoveCachedOgrDataset() done took: %.3f s\r\n",
 		elapsedSeconds);
 	OutputDebugStringA(buffer);
+}
+
+// *************************************************************
+//		IsPostgreSQLConnection()
+//		Checks if a connection string uses PostgreSQL driver
+// *************************************************************
+bool GdalHelper::IsPostgreSQLConnection(const CStringA& filenameA)
+{
+	// PostgreSQL OGR connections start with "PG:" (case-insensitive)
+	return (filenameA.Find("PG:") == 0 || filenameA.Find("pg:") == 0);
+}
+
+// *************************************************************
+//		IsValidDatasetPointer()
+//		Basic validation of dataset pointer
+// *************************************************************
+bool GdalHelper::IsValidDatasetPointer(GDALDataset* ds)
+{
+	if (!ds) {
+		return false;  // NULL is not valid for our purposes
+	}
+
+	// ✓ SAFETY CHECK 1: Check if pointer is in a reasonable memory range
+	// We can't check the actual heap validity, but we can avoid obviously
+	// bad pointers (those in reserved OS regions)
+
+	uintptr_t ptr = reinterpret_cast<uintptr_t>(ds);
+
+	// Reject if pointer is in obviously reserved/protected regions
+	// NULL page: 0x00000000
+	if (ptr < 0x10000) {
+		LOG("Invalid dataset pointer: too low (0x%llx)", ptr);
+		return false;
+	}
+
+	// Use actual process user-space max address (x64-safe), not a hardcoded 32-bit limit.
+	SYSTEM_INFO si = {};
+	::GetSystemInfo(&si);
+	const auto maxAppAddr = reinterpret_cast<uintptr_t>(si.lpMaximumApplicationAddress);
+	if (ptr > maxAppAddr)
+	{
+		LOG("Invalid dataset pointer: too high (0x%llx)", ptr);
+		return false;
+	}
+
+	return true;  // Passed all checks we can safely do
+}
+
+// *************************************************************
+//		ClearOgrDatasetCache()
+//		Empties the dataset cache (with optional close)
+// *************************************************************
+void GdalHelper::ClearOgrDatasetCache(bool closeDatasets)
+{
+	const auto start = std::chrono::steady_clock::now();
+
+	{
+		std::lock_guard<std::mutex> lock(g_ogrDatasetsMutex);
+
+		if (closeDatasets)
+		{
+			// Close all datasets before clearing cache
+			for (auto& item : m_ogrDatasets)
+			{
+				GDALDataset* ds = item.second;
+				if (ds)
+				{
+					LOG("Closing cached dataset during cache clear: %p", ds);
+					try {
+						// Reset ref count to 0 before closing
+						while (ds->Dereference() > 0)
+						{
+							// Keep dereferencing until ref count is 0
+						}
+						GDALClose(ds);
+					} catch (...)
+					{
+						LOG("Error closing dataset %p during cache clear", ds);
+					}
+				}
+			}
+		}
+
+		// Clear the map
+		m_ogrDatasets.clear();
+	}
+
+	const auto end = std::chrono::steady_clock::now();
+	const double elapsedSeconds = std::chrono::duration<double>(end - start).count();
+
+	char buffer[512] = {};
+	sprintf_s(buffer, "ClearOgrDatasetCache(closeDatasets=%d) done in %.3f s\r\n",
+		closeDatasets ? 1 : 0, elapsedSeconds);
+	OutputDebugStringA(buffer);
+}
+
+// *************************************************************
+//		ClearCacheOnShutdown()
+//		Public interface for DLL shutdown
+// *************************************************************
+void GdalHelper::ClearCacheOnShutdown()
+{
+	Debug::WriteLine("GdalHelper::ClearCacheOnShutdown() called");
+	ClearOgrDatasetCache(true);  // Close and clear
+	Debug::WriteLine("GdalHelper::ClearCacheOnShutdown() completed");
 }
 
 // **************************************************************

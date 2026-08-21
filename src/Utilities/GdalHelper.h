@@ -65,9 +65,14 @@ public:
 	static CString TiffCompressionToString(tkTiffCompression compression);
 	static tkTiffCompression ParseTiffCompression(const CString& option);
 	static const char* GetResamplingAlgorithm(tkGDALResamplingMethod resamplingAlgorithm);
+	static void ClearCacheOnShutdown();
 
 private:
 	static void RemoveCachedOgrDataset(GDALDataset* ds);
+	static bool IsPostgreSQLConnection(const CStringA& filenameA);
+	static bool IsValidDatasetPointer(GDALDataset* ds);
+	static void ClearOgrDatasetCache(bool closeDatasets = true);
+
 	// ReSharper disable once CppInconsistentNaming
 	static map<CStringA, GDALDataset*> m_ogrDatasets;
 	static std::mutex g_ogrDatasetsMutex;

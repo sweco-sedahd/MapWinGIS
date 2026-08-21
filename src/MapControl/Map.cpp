@@ -165,21 +165,21 @@ END_EVENT_MAP()
 CMapView::CMapView()
 	: _vals("AZ0CY1EX2GV3IT4KR5MP6ON7QL8SJ9UH0WF1DB2"),
 	_valsLen(39), _isSnapshot(false),
-	_brushBlue(NULL),
-	_brushBlack(NULL),
-	_brushWhite(NULL),
-	_brushLightGray(NULL),
-	_brushGray(NULL),
-	_penGray(NULL),
-	_penDarkGray(NULL),
-	_propertyExchange(NULL),
-	_bufferBitmap(NULL),
-	_tilesBitmap(NULL),
-	_layerBitmap(NULL),
-	_drawingBitmap(NULL),
-	_tempBitmap(NULL),
-	_moveBitmap(NULL),
-	_volatileBitmap(NULL)
+	_brushBlue(nullptr),
+	_brushBlack(nullptr),
+	_brushWhite(nullptr),
+	_brushLightGray(nullptr),
+	_brushGray(nullptr),
+	_penGray(nullptr),
+	_penDarkGray(nullptr),
+	_propertyExchange(nullptr),
+	_bufferBitmap(nullptr),
+	_tilesBitmap(nullptr),
+	_layerBitmap(nullptr),
+	_drawingBitmap(nullptr),
+	_tempBitmap(nullptr),
+	_moveBitmap(nullptr),
+	_volatileBitmap(nullptr)
 {
 	// GDI Plus Startup
 	GdiplusStartup();
@@ -198,6 +198,8 @@ CMapView::~CMapView()
 	this->RemoveAllLayers();
 
 	this->ClearDrawings();
+
+	GdalHelper::ClearCacheOnShutdown();
 
 	ReleaseTempObjects();
 
@@ -219,7 +221,7 @@ void CMapView::Clear()
 	ReleaseTempObjects();
 	SetDefaults();
 
-	CComPtr<IGeoProjection> p = NULL;
+	CComPtr<IGeoProjection> p = nullptr;
 	ComHelper::CreateInstance(idGeoProjection, (IDispatch**)&p);
 	SetGeoProjection(p);
 
