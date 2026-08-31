@@ -14,12 +14,15 @@ class ATL_NO_VTABLE COgrDatasource :
 public:
 	COgrDatasource()
 	{
-		_pUnkMarshaler = NULL;
-		_dataset = NULL;
+		_pUnkMarshaler = nullptr;
+		_dataset = nullptr;
 		_key = SysAllocString(L"");
 		_lastErrorCode = tkNO_ERROR;
-		_globalCallback = NULL;
+		_globalCallback = nullptr;
 		_encoding = m_globalSettings.ogrEncoding;
+		_isPgDataset = false;
+		_isClosing = false;
+		_isClosed = true;
 		gReferenceCounter.AddRef(tkInterface::idOgrDatasource);
 	}
 	~COgrDatasource()
@@ -90,6 +93,10 @@ private:
 	long _lastErrorCode;
 	BSTR _key;
 	GDALDataset* _dataset;
+	bool _isPgDataset;
+	mutable std::mutex _datasetMutex;
+	bool _isClosing;
+	bool _isClosed;
 	CStringW _connectionString;
 	tkOgrEncoding _encoding;
 

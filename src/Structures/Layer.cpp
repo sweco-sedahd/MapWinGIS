@@ -444,7 +444,7 @@ void Layer::UpdateShapefile()
 	IOgrLayer* layer;
 	if (!QueryOgrLayer(&layer))
 		return;
-	static_cast<COgrLayer*>(layer)->UpdateShapefileFromOGRLoader();
+	dynamic_cast<COgrLayer*>(layer)->UpdateShapefileFromOGRLoader();
 }
 
 //****************************************************

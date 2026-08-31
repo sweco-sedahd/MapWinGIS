@@ -15,6 +15,15 @@
 #include "TableClass.h"
 #include "TableHelper.h"
 
+struct DetachedLayerState
+{
+	GDALDataset* dataset = nullptr;
+	OGRLayer* layer = nullptr;
+	tkOgrSourceType sourceType = ogrUninitialized;
+	VARIANT_BOOL externalDatasource = VARIANT_FALSE;
+	CComPtr<IUnknown> externalOwner;
+};
+
 // *************************************************************
 //		InjectShapefile()
 // *************************************************************
@@ -321,31 +330,53 @@ STDMETHODIMP COgrLayer::Close()
 
 	StopBackgroundLoading();
 
-	if (_dataset)
-	{
-		if (_sourceType == ogrQuery && _layer) {
-			_dataset->ReleaseResultSet(_layer);
-		}
+	DetachedLayerState detached;
 
-		if (!_externalDatasource)
-		{
-			GdalHelper::CloseSharedOgrDataset(_dataset);
-		}
+	{
+		std::lock_guard<std::mutex> lock(_stateMutex);
+
+		if (_isClosed || _isClosing)
+			return S_OK;
+
+		_isClosing = true;
+
+		detached.dataset = _dataset;
+		detached.layer = _layer;
+		detached.sourceType = _sourceType;
+		detached.externalDatasource = _externalDatasource;
+		detached.externalOwner = _externalOwner;
 
 		_dataset = nullptr;
 		_layer = nullptr;
-	}
+		_externalOwner.Release();
 
-	_externalOwner.Release();
+		_sourceType = ogrUninitialized;
+		_connectionString = L"";
+		_sourceQuery = L"";
+		_forUpdate = false;
+		_activeShapeType = SHP_NULLSHAPE;
+		_externalDatasource = VARIANT_FALSE;
+
+		_isClosed = true;
+	}
 
 	CloseShapefile();
 	_updateErrors.clear();
-	_sourceType = ogrUninitialized;
-	_connectionString = L"";
-	_sourceQuery = L"";
-	_forUpdate = false;
-	_activeShapeType = SHP_NULLSHAPE;
-	_externalDatasource = VARIANT_FALSE;
+
+	if (detached.dataset)
+	{
+		if (detached.sourceType == ogrQuery && detached.layer)
+			detached.dataset->ReleaseResultSet(detached.layer);
+
+		if (detached.externalDatasource != VARIANT_TRUE)
+			GdalHelper::CloseSharedOgrDataset(detached.dataset);
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(_stateMutex);
+		_isClosing = false;
+	}
+
 	return S_OK;
 }
 
@@ -386,15 +417,20 @@ STDMETHODIMP COgrLayer::OpenDatabaseLayer(BSTR connectionString, int layerIndex,
 	AFX_MANAGE_STATE(AfxGetStaticModuleState())
 	*retVal = VARIANT_FALSE;
 
-	GDALDataset* ds = OpenDataset(connectionString, forUpdate ? true : false);
+	Close();
 
-	*retVal = OpenDatabaseLayerCore(ds, OLE2W(connectionString), layerIndex, forUpdate, VARIANT_FALSE) ? VARIANT_TRUE : VARIANT_FALSE;
+	GDALDataset* ds = OpenDataset(connectionString, forUpdate == VARIANT_TRUE);
+	if (!ds)
+		return S_OK;
 
-	if (!(*retVal))
+	const bool ok = OpenDatabaseLayerCore(ds, OLE2W(connectionString), layerIndex, forUpdate, VARIANT_FALSE);
+	if (!ok)
 	{
 		GdalHelper::CloseSharedOgrDataset(ds);
+		return S_OK;
 	}
 
+	*retVal = VARIANT_TRUE;
 	return S_OK;
 }
 
@@ -403,36 +439,43 @@ STDMETHODIMP COgrLayer::OpenDatabaseLayer(BSTR connectionString, int layerIndex,
 // *************************************************************
 bool COgrLayer::OpenDatabaseLayerCore(GDALDataset* ds, CStringW connectionString, int layerIndex, VARIANT_BOOL forUpdate, VARIANT_BOOL externalDatasource)
 {
-	Close();
-
-	if (!ds) {
+	if (!ds)
+	{
 		return false;
 	}
 
 	if (layerIndex < 0 || layerIndex >= ds->GetLayerCount())
 	{
 		ErrorMessage(tkINDEX_OUT_OF_BOUNDS);
-		return S_OK;
+		return false;
 	}
 
 	OGRLayer* layer = ds->GetLayer(layerIndex);
 	if (!layer)
 	{
 		ErrorMessage(tkFAILED_TO_OPEN_OGR_LAYER);
-		return S_OK;
+		return false;
 	}
 
-	USES_CONVERSION;
-	_connectionString = connectionString;
-	_sourceQuery = OgrHelper::OgrString2Unicode(layer->GetName());
-	_dataset = ds;
-	_layer = layer;
-	_forUpdate = forUpdate == VARIANT_TRUE;
-	_sourceType = ogrDbTable;
-	_externalDatasource = externalDatasource;
+	{
+		std::lock_guard<std::mutex> lock(_stateMutex);
+
+		if (_isClosing)
+		{
+			return false;
+		}
+
+		_connectionString = connectionString;
+		_sourceQuery = OgrHelper::OgrString2Unicode(layer->GetName());
+		_dataset = ds;
+		_layer = layer;
+		_forUpdate = forUpdate == VARIANT_TRUE;
+		_sourceType = ogrDbTable;
+		_externalDatasource = externalDatasource;
+		_isClosed = false;
+	}
 
 	InitOpenedLayer();
-
 	return true;
 }
 
@@ -441,12 +484,20 @@ bool COgrLayer::OpenDatabaseLayerCore(GDALDataset* ds, CStringW connectionString
 // *************************************************************
 bool COgrLayer::InjectLayer(GDALDataset* ds, int layerIndex, CStringW connection, VARIANT_BOOL forUpdate, IUnknown* owner)
 {
+	Close();
+
 	const bool ok = OpenDatabaseLayerCore(ds, connection, layerIndex, forUpdate, VARIANT_TRUE);
-	if (ok && owner)
+	if (!ok)
+		return false;
+
+	if (owner)
 	{
+		std::lock_guard<std::mutex> lock(_stateMutex);
 		_externalOwner = owner;
+		_externalDatasource = VARIANT_TRUE;
 	}
-	return ok;
+
+	return true;
 }
 
 // *************************************************************
@@ -486,30 +537,43 @@ STDMETHODIMP COgrLayer::OpenFromQuery(BSTR connectionString, BSTR sql, VARIANT_B
 {
 	AFX_MANAGE_STATE(AfxGetStaticModuleState())
 	*retVal = VARIANT_FALSE;
+
 	Close();
 
 	GDALDataset* ds = OpenDataset(connectionString, false);
-	if (ds)
+	if (!ds)
+		return S_OK;
+
+	OGRLayer* layer = ds->ExecuteSQL(OgrHelper::Bstr2OgrString(sql), nullptr, nullptr);
+	if (!layer)
 	{
-		OGRLayer* layer = ds->ExecuteSQL(OgrHelper::Bstr2OgrString(sql), nullptr, nullptr);
-		if (layer)
+		ErrorMessage(tkOGR_QUERY_FAILED);
+		GdalHelper::CloseSharedOgrDataset(ds);
+		return S_OK;
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(_stateMutex);
+
+		if (_isClosing)
 		{
-			_connectionString = OLE2W(connectionString);
-			_sourceQuery = OLE2W(sql);
-			_dataset = ds;
-			_layer = layer;
-			_sourceType = ogrQuery;
-			_forUpdate = VARIANT_FALSE;
-			InitOpenedLayer();
-			*retVal = VARIANT_TRUE;
+			ds->ReleaseResultSet(layer);
+			GdalHelper::CloseSharedOgrDataset(ds);
 			return S_OK;
 		}
-		else
-		{
-			ErrorMessage(tkOGR_QUERY_FAILED);
-			GdalHelper::CloseSharedOgrDataset(ds);
-		}
+
+		_connectionString = OLE2W(connectionString);
+		_sourceQuery = OLE2W(sql);
+		_dataset = ds;
+		_layer = layer;
+		_sourceType = ogrQuery;
+		_forUpdate = false;
+		_externalDatasource = VARIANT_FALSE;
+		_isClosed = false;
 	}
+
+	InitOpenedLayer();
+	*retVal = VARIANT_TRUE;
 	return S_OK;
 }
 
@@ -520,30 +584,42 @@ STDMETHODIMP COgrLayer::OpenFromDatabase(BSTR connectionString, BSTR layerName, 
 {
 	AFX_MANAGE_STATE(AfxGetStaticModuleState())
 	*retVal = VARIANT_FALSE;
+
 	Close();
 
-	GDALDataset* ds = OpenDataset(connectionString, forUpdate ? true : false);
-	if (ds)
+	GDALDataset* ds = OpenDataset(connectionString, forUpdate == VARIANT_TRUE);
+	if (!ds)
+		return S_OK;
+
+	OGRLayer* layer = ds->GetLayerByName(OgrHelper::Bstr2OgrString(layerName));
+	if (!layer)
 	{
-		OGRLayer* layer = ds->GetLayerByName(OgrHelper::Bstr2OgrString(layerName));
-		if (layer)
+		ErrorMessage(tkFAILED_TO_OPEN_OGR_LAYER);
+		GdalHelper::CloseSharedOgrDataset(ds);
+		return S_OK;
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(_stateMutex);
+
+		if (_isClosing)
 		{
-			_connectionString = OLE2W(connectionString);
-			_sourceQuery = OLE2W(layerName);
-			_sourceType = ogrDbTable;
-			_dataset = ds;
-			_layer = layer;
-			_forUpdate = forUpdate == VARIANT_FALSE;
-			InitOpenedLayer();
-			*retVal = VARIANT_TRUE;
+			GdalHelper::CloseSharedOgrDataset(ds);
 			return S_OK;
 		}
-		else
-		{
-			ErrorMessage(tkFAILED_TO_OPEN_OGR_LAYER);
-			GdalHelper::CloseSharedOgrDataset(ds);
-		}
+
+		_connectionString = OLE2W(connectionString);
+		_sourceQuery = OLE2W(layerName);
+		_sourceType = ogrDbTable;
+		_dataset = ds;
+		_layer = layer;
+		_forUpdate = forUpdate == VARIANT_TRUE;
+		_externalDatasource = VARIANT_FALSE;
+		_isClosed = false;
 	}
+
+	InitOpenedLayer();
+	*retVal = VARIANT_TRUE;
 	return S_OK;
 }
 

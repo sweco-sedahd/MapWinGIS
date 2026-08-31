@@ -741,11 +741,11 @@ IShape * OgrConverter::GeometryToShape(OGRGeometry* oGeom, bool isM,
  */
 IShapefile* OgrConverter::ReadOgrLayer(BSTR Filename, ICallback* callback)
 {
-	IShapefile* sf = NULL;
+	IShapefile* sf = nullptr;
 	GDALDataset* ds = GdalHelper::OpenOgrDatasetW(OLE2W(Filename), false, false);
 	if (!ds)
 	{
-		return NULL;
+		return nullptr;
 	}
 	
 	OGRLayer* layer = ds->GetLayer(0);

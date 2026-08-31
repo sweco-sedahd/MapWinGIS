@@ -85,22 +85,38 @@ STDMETHODIMP COgrDatasource::Open(BSTR connectionString, VARIANT_BOOL* retVal)
 STDMETHODIMP COgrDatasource::Open2(BSTR connectionString, VARIANT_BOOL forUpdate, VARIANT_BOOL* retVal)
 {
 	AFX_MANAGE_STATE(AfxGetStaticModuleState())
-	Close();
 	*retVal = VARIANT_FALSE;
+
+	std::lock_guard<std::mutex> lock(_datasetMutex);
+
+	_isClosing = true;
+
+	if (_dataset)
+	{
+		GdalHelper::CloseSharedOgrDataset(_dataset);
+		_dataset = nullptr;
+	}
+
+	_connectionString = L"";
+	_isPgDataset = false;
+	_isClosed = true;
 
 	GDALDataset* ds = GdalHelper::OpenOgrDatasetW(OLE2W(connectionString), forUpdate ? true : false, true);
 	if (!ds)
 	{
+		_isClosing = false;
 		// clients should extract last GDAL error
 		ErrorMessage(tkFAILED_TO_OPEN_OGR_DATASOURCE);
 		return S_OK;
 	}
-	else
-	{
-		_connectionString = connectionString;
-		_dataset = ds;
-		*retVal = VARIANT_TRUE;
-	}
+
+	_dataset = ds;
+	_connectionString = connectionString;
+	_isPgDataset = GdalHelper::IsPostgreSQLConnection(connectionString);
+	_isClosed = false;
+	_isClosing = false;
+	*retVal = VARIANT_TRUE;
+
 	return S_OK;
 }
 
@@ -110,11 +126,28 @@ STDMETHODIMP COgrDatasource::Open2(BSTR connectionString, VARIANT_BOOL forUpdate
 STDMETHODIMP COgrDatasource::Close()
 {
 	AFX_MANAGE_STATE(AfxGetStaticModuleState())
-	if (_dataset)
+
+	std::lock_guard<std::mutex> lock(_datasetMutex);
+
+	if (_isClosed || _isClosing)
 	{
-		GdalHelper::CloseSharedOgrDataset(_dataset);
-		_dataset = nullptr;
+		return S_OK;
 	}
+
+	_isClosing = true;
+
+	GDALDataset* ds = _dataset;
+	_dataset = nullptr;
+	_connectionString = L"";
+	_isPgDataset = false;
+	_isClosed = true;
+
+	if (ds)
+	{
+		GdalHelper::CloseSharedOgrDataset(ds);
+	}
+
+	_isClosing = false;
 	return S_OK;
 }
 

@@ -36,9 +36,36 @@
 #include "GdalDriverHelper.h"
 #include "RasterBandHelper.h"
 
-// ReSharper disable once CppInconsistentNaming
-map<CStringA, GDALDataset*> GdalHelper::m_ogrDatasets;
-std::mutex GdalHelper::g_ogrDatasetsMutex;
+enum class OgrConnectionKind
+{
+	Other,
+	PostgreSql,
+};
+
+enum class OgrOwnershipKind
+{
+	SharedCache,
+	DirectOwned,
+};
+
+enum class OgrCloseState
+{
+	Open,
+	Closing,
+	Closed,
+};
+
+struct OgrDatasetTrackingInfo
+{
+	OgrConnectionKind connectionKind;
+	OgrOwnershipKind ownershipKind;
+	OgrCloseState closeState;
+};
+
+static std::map<CStringA, GDALDataset*> s_ogrDatasets;
+static std::map<GDALDataset*, OgrDatasetTrackingInfo> s_ogrTracking;
+static std::mutex s_ogrMutex;
+static std::mutex s_postgreSqlMutex;
 
 // ===== HELPER FUNCTIONS =====
 
@@ -130,24 +157,24 @@ GDALDataset* GdalHelper::OpenOgrDatasetW(const CStringW& filenameW, const bool f
 		};
 
 	// PostgreSQL (libpq) connections are NOT thread-safe, so don't share them.
-	bool isPostgreSQL = IsPostgreSQLConnection(filenameA);
-	bool canUseSharedCache = allowShared &&
-							m_globalSettings.ogrShareConnection &&
-							!isPostgreSQL;
+	const bool isPostgreSql = IsPostgreSQLConnection(filenameA);
+	const bool canUseSharedCache = allowShared && m_globalSettings.ogrShareConnection && !isPostgreSql;
+	const CStringA cacheKey = filenameA + (forUpdate ? "1" : "0");
 
 	if (canUseSharedCache)
 	{
-		CStringA key = filenameA;
-		key += forUpdate ? "1" : "0";
-
 		{
-			std::lock_guard<std::mutex> lock(g_ogrDatasetsMutex);
-
-			auto it = m_ogrDatasets.find(key);
-			if (it != m_ogrDatasets.end())
+			std::lock_guard<std::mutex> lock(s_ogrMutex);
+			auto it = s_ogrDatasets.find(cacheKey);
+			if (it != s_ogrDatasets.end())
 			{
 				GDALDataset* ds = it->second;
 				ds->Reference();
+				auto tr = s_ogrTracking.find(ds);
+				if (tr != s_ogrTracking.end())
+				{
+					tr->second.closeState = OgrCloseState::Open;
+				}
 				logExit("cache-hit");
 				return ds;
 			}
@@ -160,29 +187,48 @@ GDALDataset* GdalHelper::OpenOgrDatasetW(const CStringW& filenameW, const bool f
 			return nullptr;
 		}
 
+		std::lock_guard<std::mutex> lock(s_ogrMutex);
+		auto it = s_ogrDatasets.find(cacheKey);
+		if (it != s_ogrDatasets.end())
 		{
-			std::lock_guard<std::mutex> lock(g_ogrDatasetsMutex);
-
-			auto it = m_ogrDatasets.find(key);
-			if (it != m_ogrDatasets.end())
+			GDALDataset* ds = it->second;
+			ds->Reference();
+			GDALClose(opened);
+			auto tr = s_ogrTracking.find(ds);
+			if (tr != s_ogrTracking.end())
 			{
-				GDALDataset* ds = it->second;
-				ds->Reference();
-				GDALClose(opened);
-				logExit("cache-race-hit");
-				return ds;
+				tr->second.closeState = OgrCloseState::Open;
 			}
-
-			m_ogrDatasets[key] = opened;
+			logExit("cache-race-hit");
+			return ds;
 		}
 
+		s_ogrDatasets[cacheKey] = opened;
+		s_ogrTracking[opened] = { OgrConnectionKind::Other, OgrOwnershipKind::SharedCache, OgrCloseState::Open };
 		logExit("opened-shared");
 		return opened;
 	}
 
-	// Non-shared: just open directly (no cache)
+	if (isPostgreSql)
+	{
+		std::lock_guard<std::mutex> pgLock(s_postgreSqlMutex);
+		GDALDataset* ds = OpenOgrDatasetA(filenameA.GetString(), forUpdate);
+		if (ds)
+		{
+			std::lock_guard<std::mutex> lock(s_ogrMutex);
+			s_ogrTracking[ds] = { OgrConnectionKind::PostgreSql, OgrOwnershipKind::DirectOwned, OgrCloseState::Open };
+		}
+		logExit(ds ? "opened-pg-direct" : "open-failed");
+		return ds;
+	}
+
 	GDALDataset* ds = OpenOgrDatasetA(filenameA.GetString(), forUpdate);
-	logExit(ds ? "opened" : "open-failed");
+	if (ds)
+	{
+		std::lock_guard<std::mutex> lock(s_ogrMutex);
+		s_ogrTracking[ds] = { OgrConnectionKind::Other, OgrOwnershipKind::DirectOwned, OgrCloseState::Open };
+	}
+	logExit(ds ? "opened-direct" : "open-failed");
 	return ds;
 }
 
@@ -199,7 +245,7 @@ int GdalHelper::CloseSharedOgrDataset(GDALDataset* ds)
 	const auto start = std::chrono::steady_clock::now();
 	int count = 0;
 	bool shouldClose = false;
-	bool isCachedShared = false;
+	bool usePgMutex = false;
 
 	auto logExit = [&](const char* outcome)
 		{
@@ -216,85 +262,69 @@ int GdalHelper::CloseSharedOgrDataset(GDALDataset* ds)
 		};
 
 	{
-		std::lock_guard<std::mutex> lock(g_ogrDatasetsMutex);
-
-		// ✓ SAFETY CHECK 2: Verify dataset is in cache
-		for (const auto& item : m_ogrDatasets)
+		std::lock_guard<std::mutex> lock(s_ogrMutex);
+		auto tr = s_ogrTracking.find(ds);
+		if (tr == s_ogrTracking.end())
 		{
-			if (item.second == ds)
-			{
-				isCachedShared = true;
-				break;
-			}
+			GDALClose(ds);
+			logExit("closed-untracked");
+			return 0;
 		}
 
-		if (isCachedShared)
+		if (tr->second.closeState == OgrCloseState::Closing || tr->second.closeState == OgrCloseState::Closed)
 		{
-			// ✓ SAFETY CHECK 3: Validate pointer before dereferencing
-			if (!IsValidDatasetPointer(ds))
-			{
-				LOG("ERROR: Dataset pointer is invalid in cache! %p", ds);
-				// Remove corrupted entry from cache
-				RemoveCachedOgrDatasetUnlocked(m_ogrDatasets, ds);
-				logExit("invalid-pointer-removed");
-				return 0;  // Can't proceed safely
-			}
+			logExit("already-closing-or-closed");
+			return 0;
+		}
 
-			// Safe to dereference now
+		if (tr->second.ownershipKind == OgrOwnershipKind::SharedCache)
+		{
 			count = ds->Dereference();
 			if (count <= 0)
 			{
-				// Reference count is zero, safe to close
-				RemoveCachedOgrDatasetUnlocked(m_ogrDatasets, ds);
+				tr->second.closeState = OgrCloseState::Closing;
+				RemoveCachedOgrDatasetUnlocked(s_ogrDatasets, ds);
 				shouldClose = true;
 			}
 			else
 			{
-				// Still have references, don't close yet
-				DEBUG_LOG("Dereferencing shared datasource: refCount=%d", count);
-			}
-		}
-	}
-
-	// ✓ SAFETY CHECK 4: After releasing lock, re-validate before closing
-	if (isCachedShared)
-	{
-		if (shouldClose)
-		{
-			// Do a final check: is the pointer still valid?
-			if (!IsValidDatasetPointer(ds))
-			{
-				LOG("ERROR: Dataset pointer became invalid after lock release! %p", ds);
-				logExit("invalid-after-unlock");
+				logExit("shared-still-referenced");
 				return count;
 			}
+		}
+		else
+		{
+			tr->second.closeState = OgrCloseState::Closing;
+			shouldClose = true;
+		}
 
-			// ✓ Now safe to close
+		usePgMutex = tr->second.connectionKind == OgrConnectionKind::PostgreSql;
+	}
+
+	if (shouldClose)
+	{
+		if (usePgMutex)
+		{
+			std::lock_guard<std::mutex> pgLock(s_postgreSqlMutex);
 			GDALClose(ds);
 		}
-		logExit("closed-cached-shared");
-		return count;
+		else
+		{
+			GDALClose(ds);
+		}
+
+		std::lock_guard<std::mutex> lock(s_ogrMutex);
+		auto tr = s_ogrTracking.find(ds);
+		if (tr != s_ogrTracking.end())
+		{
+			tr->second.closeState = OgrCloseState::Closed;
+			s_ogrTracking.erase(tr);
+		}
+
+		logExit("closed");
 	}
 
-	// ✓ SAFETY CHECK 5: Non-cached dataset
-	// This path is taken when dataset is NOT in the shared cache
-	// This should only happen if:
-	//   1. It was opened with allowShared=false
-	//   2. It was already removed from cache
-	//   3. It's a stale pointer
-
-	// Validate before closing
-	if (!IsValidDatasetPointer(ds))
-	{
-		LOG("ERROR: Non-cached dataset pointer is invalid! %p", ds);
-		logExit("invalid-non-cached");
-		return 0;
-	}
-
-	// Safe to close non-cached dataset
-	GDALClose(ds);
-	logExit("closed-non-cached");
-	return 0;
+	return count;
 }
 
 // **************************************************************
@@ -304,8 +334,8 @@ void GdalHelper::RemoveCachedOgrDataset(GDALDataset* ds)
 {
 	const auto start = std::chrono::steady_clock::now();
 
-	std::lock_guard<std::mutex> lock(g_ogrDatasetsMutex);
-	RemoveCachedOgrDatasetUnlocked(m_ogrDatasets, ds);
+	std::lock_guard<std::mutex> lock(s_ogrMutex);
+	RemoveCachedOgrDatasetUnlocked(s_ogrDatasets, ds);
 
 	const auto end = std::chrono::steady_clock::now();
 	const double elapsedSeconds = std::chrono::duration<double>(end - start).count();
@@ -369,46 +399,72 @@ bool GdalHelper::IsValidDatasetPointer(GDALDataset* ds)
 // *************************************************************
 void GdalHelper::ClearOgrDatasetCache(bool closeDatasets)
 {
-	const auto start = std::chrono::steady_clock::now();
+	std::vector<GDALDataset*> toClose;
+	std::vector<GDALDataset*> toClosePg;
 
 	{
-		std::lock_guard<std::mutex> lock(g_ogrDatasetsMutex);
-
+		std::lock_guard<std::mutex> lock(s_ogrMutex);
 		if (closeDatasets)
 		{
-			// Close all datasets before clearing cache
-			for (auto& item : m_ogrDatasets)
+			for (auto& pair : s_ogrTracking)
 			{
-				GDALDataset* ds = item.second;
-				if (ds)
+				GDALDataset* ds = pair.first;
+				OgrDatasetTrackingInfo& info = pair.second;
+				if (!ds || info.closeState != OgrCloseState::Open)
 				{
-					LOG("Closing cached dataset during cache clear: %p", ds);
-					try {
-						// Reset ref count to 0 before closing
-						while (ds->Dereference() > 0)
-						{
-							// Keep dereferencing until ref count is 0
-						}
-						GDALClose(ds);
-					} catch (...)
+					continue;
+				}
+
+				if (info.ownershipKind == OgrOwnershipKind::SharedCache || info.ownershipKind == OgrOwnershipKind::DirectOwned)
+				{
+					info.closeState = OgrCloseState::Closing;
+					if (info.connectionKind == OgrConnectionKind::PostgreSql)
 					{
-						LOG("Error closing dataset %p during cache clear", ds);
+						toClosePg.push_back(ds);
+					}
+					else
+					{
+						toClose.push_back(ds);
 					}
 				}
 			}
 		}
 
-		// Clear the map
-		m_ogrDatasets.clear();
+		s_ogrDatasets.clear();
 	}
 
-	const auto end = std::chrono::steady_clock::now();
-	const double elapsedSeconds = std::chrono::duration<double>(end - start).count();
+	for (auto* ds : toClose)
+	{
+		GDALClose(ds);
+	}
 
-	char buffer[512] = {};
-	sprintf_s(buffer, "ClearOgrDatasetCache(closeDatasets=%d) done in %.3f s\r\n",
-		closeDatasets ? 1 : 0, elapsedSeconds);
-	OutputDebugStringA(buffer);
+	if (!toClosePg.empty())
+	{
+		std::lock_guard<std::mutex> pgLock(s_postgreSqlMutex);
+		for (auto* ds : toClosePg)
+		{
+			GDALClose(ds);
+		}
+	}
+
+	std::lock_guard<std::mutex> lock(s_ogrMutex);
+	for (auto* ds : toClose)
+	{
+		auto it = s_ogrTracking.find(ds);
+		if (it != s_ogrTracking.end())
+		{
+			it->second.closeState = OgrCloseState::Closed;
+		}
+	}
+	for (auto* ds : toClosePg)
+	{
+		auto it = s_ogrTracking.find(ds);
+		if (it != s_ogrTracking.end())
+		{
+			it->second.closeState = OgrCloseState::Closed;
+		}
+	}
+	s_ogrTracking.clear();
 }
 
 // *************************************************************

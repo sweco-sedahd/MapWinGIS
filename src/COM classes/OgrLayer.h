@@ -4,6 +4,7 @@
 #include "ogrsf_frmts.h"
 #include "afxmt.h"
 #include "OgrLoader.h"
+#include <mutex>
 
 #if defined(_WIN32_WCE) && !defined(_CE_DCOM) && !defined(_CE_ALLOW_SINGLE_THREADED_OBJECTS_IN_MTA)
 #error "Single-threaded COM objects are not properly supported on Windows CE platform, such as the Windows Mobile platforms that do not include full DCOM support. Define _CE_ALLOW_SINGLE_THREADED_OBJECTS_IN_MTA to force ATL to support creating single-thread COM object's and allow use of it's single-threaded COM object implementations. The threading model in your rgs file was set to 'Free' as that is the only threading model supported in non DCOM Windows CE platforms."
@@ -32,6 +33,8 @@ public:
 		_featureCount = -1;
 		_activeShapeType = SHP_NULLSHAPE;
 		_externalDatasource = VARIANT_FALSE;
+		_isClosing = false;
+		_isClosed = true;
 		_loader.SetMaxCacheCount(m_globalSettings.ogrLayerMaxFeatureCount);
 		gReferenceCounter.AddRef(tkInterface::idOgrLayer);
 	}
@@ -145,7 +148,10 @@ private:
 	int _featureCount;
 	OgrDynamicLoader _loader;
 	ShpfileType _activeShapeType;		// this type will be used in case layer holds geometries of various types
-	
+	mutable std::mutex _stateMutex;
+	bool _isClosing;
+	bool _isClosed;
+
 private:
 	bool CheckState();
 	void ErrorMessage(long ErrorCode);
