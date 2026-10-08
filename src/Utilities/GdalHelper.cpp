@@ -266,6 +266,14 @@ int GdalHelper::CloseSharedOgrDataset(GDALDataset* ds)
 		auto tr = s_ogrTracking.find(ds);
 		if (tr == s_ogrTracking.end())
 		{
+			// Never tracked by this helper - safe to close directly.
+			// NOTE: datasets that WERE tracked are never removed from s_ogrTracking
+			// (see below), so reaching this branch for a previously-tracked pointer
+			// would indicate a double-close bug upstream. Erasing entries on close
+			// used to cause exactly that: a second close call on an already-freed
+			// GDALDataset* would fall through here and call GDALClose() again,
+			// corrupting the heap. Keeping the entry (closeState = Closed) lets us
+			// detect and reject that duplicate call below instead.
 			GDALClose(ds);
 			logExit("closed-untracked");
 			return 0;
@@ -317,8 +325,13 @@ int GdalHelper::CloseSharedOgrDataset(GDALDataset* ds)
 		auto tr = s_ogrTracking.find(ds);
 		if (tr != s_ogrTracking.end())
 		{
+			// Keep the tracking entry around (marked Closed) instead of erasing it.
+			// This lets any later duplicate CloseSharedOgrDataset() call on the same
+			// (now-dangling) pointer be detected and safely rejected above, rather
+			// than falling into the "untracked" branch and calling GDALClose() a
+			// second time on freed memory (which corrupts the heap). A subsequent
+			// OpenOgrDatasetW() that reuses this address will overwrite the entry.
 			tr->second.closeState = OgrCloseState::Closed;
-			s_ogrTracking.erase(tr);
 		}
 
 		logExit("closed");
