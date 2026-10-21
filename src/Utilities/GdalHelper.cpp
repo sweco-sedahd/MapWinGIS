@@ -138,8 +138,11 @@ GDALDataset* GdalHelper::OpenOgrDatasetW(const CStringW& filenameW, const bool f
 {
 	const auto start = std::chrono::steady_clock::now();
 	CStringA filenameA = Utility::ConvertToUtf8(filenameW);
+	// PostgreSQL (libpq) connections are NOT thread-safe, so don't share them.
+	const bool isPostgreSql = IsPostgreSQLConnection(filenameA);
+	const bool canUseSharedCache = allowShared && m_globalSettings.ogrShareConnection; // && !isPostgreSql;
 
-	auto logExit = [&](const char* outcome)
+	auto logExit = [&](const char* outcome, GDALDataset* ds = nullptr)
 		{
 			const auto end = std::chrono::steady_clock::now();
 			const double elapsedSeconds = std::chrono::duration<double>(end - start).count();
@@ -147,18 +150,18 @@ GDALDataset* GdalHelper::OpenOgrDatasetW(const CStringW& filenameW, const bool f
 			char buffer[1024] = {};
 			sprintf_s(
 				buffer,
-				"OpenOgrDatasetW('%s', forUpdate=%d, allowShared=%d, outcome=%s) took: %.3f s\r\n",
+				"OpenOgrDatasetW('%s', forUpdate=%d, allowShared=%d, outcome=%s) isPostgreSql: %d, canUseSharedCache:%d , dataset=%p took: %.3f s\r\n",
 				filenameA.GetString(),
 				forUpdate ? 1 : 0,
 				allowShared ? 1 : 0,
 				outcome,
+				isPostgreSql ? 1 : 0,
+				canUseSharedCache ? 1: 0,
+				static_cast<void*>(ds),
 				elapsedSeconds);
 			OutputDebugStringA(buffer);
 		};
 
-	// PostgreSQL (libpq) connections are NOT thread-safe, so don't share them.
-	const bool isPostgreSql = IsPostgreSQLConnection(filenameA);
-	const bool canUseSharedCache = allowShared && m_globalSettings.ogrShareConnection && !isPostgreSql;
 	const CStringA cacheKey = filenameA + (forUpdate ? "1" : "0");
 
 	if (canUseSharedCache)
@@ -175,7 +178,7 @@ GDALDataset* GdalHelper::OpenOgrDatasetW(const CStringW& filenameW, const bool f
 				{
 					tr->second.closeState = OgrCloseState::Open;
 				}
-				logExit("cache-hit");
+				logExit("cache-hit", ds);
 				return ds;
 			}
 		}
@@ -199,13 +202,13 @@ GDALDataset* GdalHelper::OpenOgrDatasetW(const CStringW& filenameW, const bool f
 			{
 				tr->second.closeState = OgrCloseState::Open;
 			}
-			logExit("cache-race-hit");
+			logExit("cache-race-hit", ds);
 			return ds;
 		}
 
 		s_ogrDatasets[cacheKey] = opened;
 		s_ogrTracking[opened] = { OgrConnectionKind::Other, OgrOwnershipKind::SharedCache, OgrCloseState::Open };
-		logExit("opened-shared");
+		logExit("opened-shared", opened);
 		return opened;
 	}
 
@@ -218,7 +221,7 @@ GDALDataset* GdalHelper::OpenOgrDatasetW(const CStringW& filenameW, const bool f
 			std::lock_guard<std::mutex> lock(s_ogrMutex);
 			s_ogrTracking[ds] = { OgrConnectionKind::PostgreSql, OgrOwnershipKind::DirectOwned, OgrCloseState::Open };
 		}
-		logExit(ds ? "opened-pg-direct" : "open-failed");
+		logExit(ds ? "opened-pg-direct" : "open-failed", ds);
 		return ds;
 	}
 
@@ -228,7 +231,7 @@ GDALDataset* GdalHelper::OpenOgrDatasetW(const CStringW& filenameW, const bool f
 		std::lock_guard<std::mutex> lock(s_ogrMutex);
 		s_ogrTracking[ds] = { OgrConnectionKind::Other, OgrOwnershipKind::DirectOwned, OgrCloseState::Open };
 	}
-	logExit(ds ? "opened-direct" : "open-failed");
+	logExit(ds ? "opened-direct" : "open-failed", ds);
 	return ds;
 }
 
@@ -242,12 +245,16 @@ int GdalHelper::CloseSharedOgrDataset(GDALDataset* ds)
 		return 0;
 	}
 
+	char buff[512] = {};
+	sprintf_s(buff, "CloseSharedOgrDataset(%p)\r\n", ds);
+	OutputDebugStringA(buff);
+
 	const auto start = std::chrono::steady_clock::now();
 	int count = 0;
 	bool shouldClose = false;
 	bool usePgMutex = false;
 
-	auto logExit = [&](const char* outcome)
+	auto logExit = [&](const char* outcome, GDALDataset* ds = nullptr)
 		{
 			const auto end = std::chrono::steady_clock::now();
 			const double elapsedSeconds = std::chrono::duration<double>(end - start).count();
@@ -255,7 +262,8 @@ int GdalHelper::CloseSharedOgrDataset(GDALDataset* ds)
 			char buffer[1024] = {};
 			sprintf_s(
 				buffer,
-				"CloseSharedOgrDataset() outcome=%s took: %.3f s\r\n",
+				"CloseSharedOgrDataset(dataset=%p) outcome=%s took: %.3f s\r\n",
+				ds,
 				outcome,
 				elapsedSeconds);
 			OutputDebugStringA(buffer);
@@ -266,16 +274,8 @@ int GdalHelper::CloseSharedOgrDataset(GDALDataset* ds)
 		auto tr = s_ogrTracking.find(ds);
 		if (tr == s_ogrTracking.end())
 		{
-			// Never tracked by this helper - safe to close directly.
-			// NOTE: datasets that WERE tracked are never removed from s_ogrTracking
-			// (see below), so reaching this branch for a previously-tracked pointer
-			// would indicate a double-close bug upstream. Erasing entries on close
-			// used to cause exactly that: a second close call on an already-freed
-			// GDALDataset* would fall through here and call GDALClose() again,
-			// corrupting the heap. Keeping the entry (closeState = Closed) lets us
-			// detect and reject that duplicate call below instead.
 			GDALClose(ds);
-			logExit("closed-untracked");
+			logExit("closed-untracked", ds);
 			return 0;
 		}
 
@@ -325,16 +325,11 @@ int GdalHelper::CloseSharedOgrDataset(GDALDataset* ds)
 		auto tr = s_ogrTracking.find(ds);
 		if (tr != s_ogrTracking.end())
 		{
-			// Keep the tracking entry around (marked Closed) instead of erasing it.
-			// This lets any later duplicate CloseSharedOgrDataset() call on the same
-			// (now-dangling) pointer be detected and safely rejected above, rather
-			// than falling into the "untracked" branch and calling GDALClose() a
-			// second time on freed memory (which corrupts the heap). A subsequent
-			// OpenOgrDatasetW() that reuses this address will overwrite the entry.
 			tr->second.closeState = OgrCloseState::Closed;
+			s_ogrTracking.erase(tr);
 		}
 
-		logExit("closed");
+		logExit("closed", ds);
 	}
 
 	return count;
@@ -367,7 +362,7 @@ void GdalHelper::RemoveCachedOgrDataset(GDALDataset* ds)
 bool GdalHelper::IsPostgreSQLConnection(const CStringA& filenameA)
 {
 	// PostgreSQL OGR connections start with "PG:" (case-insensitive)
-	return (filenameA.Find("PG:") == 0 || filenameA.Find("pg:") == 0);
+	return filenameA.Left(3).CompareNoCase("PG:") == 0;
 }
 
 // *************************************************************
