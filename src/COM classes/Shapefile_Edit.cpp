@@ -618,6 +618,10 @@ STDMETHODIMP CShapefile::EditInsertShape(IShape *shape, long *shapeIndex, VARIAN
 
 		RegisterNewShape(shape, *shapeIndex);
 
+		// indices of the following shapes have shifted, so the QTree must be rebuilt
+		if (_useQTree && *shapeIndex < static_cast<long>(_shapeData.size()) - 1)
+			GenerateQTree();
+
 		*retval = VARIANT_TRUE;
 	}
 
@@ -735,7 +739,10 @@ STDMETHODIMP CShapefile::EditDeleteShape(long shapeIndex, VARIANT_BOOL *retval)
                 }
 				_sortingChanged = true;
 
-				// TODO: why haven't we updated QTree?
+				// indices of the following shapes have shifted, so the QTree must be rebuilt
+				if (_useQTree)
+					GenerateQTree();
+
 				*retval = VARIANT_TRUE;
 			}
 		}

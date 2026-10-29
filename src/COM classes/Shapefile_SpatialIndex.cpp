@@ -447,6 +447,12 @@ STDMETHODIMP CShapefile::QuickQueryInEditMode(IExtents* boundBox, int** result, 
 
 		const vector<int> r = _qtree->GetNodes(QTreeExtent(xMin, xMax, yMax, yMin));
 		const int size = gsl::narrow_cast<int>(r.size());
+		*resultCount = size;
+		if (size == 0)
+		{
+			*result = nullptr;
+			return S_OK;
+		}
 		*result = new int[size];
 
 		//memcpy(*result, &r[0], sizeof(int) * size);
